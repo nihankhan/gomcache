@@ -21,35 +21,49 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
+	"time"
+)
+
+var (
+	ErrCacheMiss    = errors.New("memcache: cache miss")
+	ErrNotStored    = errors.New("memcache: item not stored")
+	ErrServerError  = errors.New("memcache: server error")
+	ErrNoStats      = errors.New("memcache: no statistics available")
+	ErrCASConflict  = errors.New("memcache: compare-and-swap conflict")
+	ErrMalformedKey = errors.New("malformed: key is too long or contains invalid characters")
+	ErrNoServers    = errors.New("memcache: no servers configured or available")
+)
+
+const (
+	// DefaultTimeout is the default socket read/write timeout.
+	DefaultTimeout = 500 * time.Millisecond
+
+	// DefaultMaxIdleConns is the default maximum number of idle connections
+	// kept for any single address.
+	DefaultMaxIdleConns = 2
+)
+
+var (
+	crlf           = []byte("\r\n")
+	resultStored   = []byte("STORED\r\n")
+	resultNotFound = []byte("NOT_FOUND\r\n")
+	resultDeleted  = []byte("DELETED\r\n")
+	resultEnd      = []byte("END\r\n")
+	versionPrefix  = []byte("VERSION")
 )
 
 // Client represents a Memcached client.
 type Client struct {
 	selector ServerSelector
 	UseUDP   bool
-	mu       sync.Mutex
-}
 
-// NewClient creates a new Client with the specified servers and UDP mode.
-func NewClient(servers []string, useUDP bool) (*Client, error) {
-	ss := &ServerList{}
-	if err := ss.SetServers(servers...); err != nil {
-		return nil, err
-	}
-
-	return &Client{
-		selector: ss,
-		UseUDP:   useUDP,
-	}, nil
-}
-
-// SelectServer selects a server using the selector.
-func (c *Client) SelectServer(key string) (string, error) {
-	return c.selector.Select(key)
+	// Timeout specifies the socket read/write timeout. If zero, DefaultTimeout is used.
+	Timeout time.Duration
+	mu      sync.Mutex
 }
 
 // Item represents a Memcached item.
@@ -60,16 +74,37 @@ type Item struct {
 	Expiration int32
 }
 
+// NewClient creates a new Client with the specified servers and UDP mode.
+func NewClient(servers []string, useUDP bool) (*Client, error) {
+	ss := &ServerList{}
+	if err := ss.SetServers(servers...); err != nil {
+		return nil, ErrNoServers
+	}
+
+	return NewFromSelector(ss, useUDP)
+}
+
+// SelectServer selects a server using the selector.
+func (c *Client) SelectServer(key string) (string, error) {
+	return c.selector.Select(key)
+}
+
 // connect establishes a TCP connection to the selected Memcached server.
 func (c *Client) connect(key string) (net.Conn, error) {
 	addr, err := c.SelectServer(key)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.DialTimeout("tcp", addr, c.Timeout)
 	if err != nil {
 		return nil, err
 	}
+
+	err = conn.SetDeadline(time.Now().Add(c.Timeout))
+	if err != nil {
+		return nil, err
+	}
+
 	return conn, nil
 }
 
@@ -87,6 +122,13 @@ func (c *Client) connectUDP(key string) (*net.UDPConn, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Set the read and write deadline based on the timeout
+	err = conn.SetDeadline(time.Now().Add(c.Timeout))
+	if err != nil {
+		return nil, err
+	}
+
 	return conn, nil
 }
 
@@ -95,28 +137,35 @@ func (c *Client) Set(item *Item) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Establish a TCP connection to the server
 	conn, err := c.connect(item.Key)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
+	// Create and send the 'set' command
 	req := fmt.Sprintf("set %s %d %d %d\r\n%s\r\n", item.Key, item.Flags, item.Expiration, len(item.Value), string(item.Value))
 	_, err = conn.Write([]byte(req))
 	if err != nil {
 		return err
 	}
 
-	resp, err := bufio.NewReader(conn).ReadString('\n')
+	// Read the response
+	resp, err := bufio.NewReader(conn).ReadBytes('\n')
 	if err != nil {
-		return err
+		return ErrServerError
 	}
 
-	if strings.TrimSpace(resp) == "STORED" {
+	// Compare the response with predefined byte slices
+	switch {
+	case bytes.Equal(resp, resultStored):
 		return nil
+	case bytes.Equal(resp, resultNotFound):
+		return ErrCacheMiss
+	default:
+		return fmt.Errorf("unexpected response: %s", resp)
 	}
-
-	return fmt.Errorf("unexpected response: %s", resp)
 }
 
 // Get retrieves an item from the Memcached server using UDP.
@@ -142,11 +191,10 @@ func (c *Client) Get(key string) (*Item, error) {
 	binary.BigEndian.PutUint16(frameHeader[6:8], 0) // Reserved
 
 	// Prepare the Get command
-	getCommand := fmt.Sprintf("get %s\r\n", key)
-	request := append(frameHeader, []byte(getCommand)...)
+	getCommand := append(frameHeader, []byte("get "+key)...)
 
 	// Send the Get command
-	_, err = conn.Write(request)
+	_, err = conn.Write(append(getCommand, crlf...))
 	if err != nil {
 		return nil, fmt.Errorf("error writing to UDP: %v", err)
 	}
@@ -163,23 +211,25 @@ func (c *Client) Get(key string) (*Item, error) {
 		// Append the data to the response buffer
 		responseBuffer.Write(buffer[8:n])
 
-		// Check for the end of the response (e.g., `END`)
-		if strings.Contains(responseBuffer.String(), "END\r\n") {
+		// Check for the end of the response
+		if bytes.Contains(responseBuffer.Bytes(), resultEnd) {
 			break
 		}
 	}
 
 	// Parse the response
-	rawResponse := responseBuffer.String()
-	if strings.HasPrefix(rawResponse, "VALUE") {
-		lines := strings.Split(rawResponse, "\r\n")
-		if len(lines) >= 3 {
+	rawResponse := responseBuffer.Bytes()
+	if bytes.HasPrefix(rawResponse, []byte("VALUE")) {
+		lines := bytes.Split(rawResponse, crlf)
+		if len(lines) >= 2 {
 			value := lines[1] // Extract the value part
 			return &Item{
 				Key:   key,
-				Value: []byte(value),
+				Value: value,
 			}, nil
 		}
+	} else if bytes.HasPrefix(rawResponse, resultNotFound) {
+		return nil, ErrCacheMiss
 	}
 
 	return nil, fmt.Errorf("unexpected response: %s", rawResponse)
@@ -202,20 +252,20 @@ func (c *Client) Delete(key string) error {
 		return err
 	}
 
-	resp, err := bufio.NewReader(conn).ReadString('\n')
+	resp, err := bufio.NewReader(conn).ReadBytes('\n')
 	if err != nil {
-		return err
+		return ErrServerError
 	}
 
-	if strings.TrimSpace(resp) == "DELETED" {
+	// Compare the response with predefined byte slices
+	switch {
+	case bytes.Equal(resp, resultDeleted):
 		return nil
-	}
-
-	if strings.TrimSpace(resp) == "NOT_FOUND" {
+	case bytes.Equal(resp, resultNotFound):
 		return fmt.Errorf("item not found")
+	default:
+		return fmt.Errorf("unexpected response: %s", resp)
 	}
-
-	return fmt.Errorf("unexpected response: %s", resp)
 }
 
 // Ping checks if the server is responsive by sending a "version" command.
@@ -229,17 +279,20 @@ func (c *Client) Ping(key string) error {
 	}
 	defer conn.Close()
 
-	_, err = conn.Write([]byte("version\r\n"))
+	// Send the "version" command
+	_, err = conn.Write(append(versionPrefix, crlf...))
 	if err != nil {
 		return err
 	}
 
-	resp, err := bufio.NewReader(conn).ReadString('\n')
+	// Read the response
+	resp, err := bufio.NewReader(conn).ReadBytes('\n')
 	if err != nil {
-		return err
+		return ErrServerError
 	}
 
-	if strings.HasPrefix(resp, "VERSION") {
+	// Check if the response starts with "VERSION"
+	if bytes.HasPrefix(resp, versionPrefix) {
 		return nil
 	}
 

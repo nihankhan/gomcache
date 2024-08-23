@@ -32,6 +32,15 @@ type ServerSelector interface {
 	Each(func(string) error) error
 }
 
+// NewFromSelector returns a new Client using the provided ServerSelector and UDP mode.
+func NewFromSelector(ss ServerSelector, useUDP bool) (*Client, error) {
+	return &Client{
+		selector: ss,
+		UseUDP:   useUDP,
+		Timeout:  DefaultTimeout,
+	}, nil
+}
+
 // ServerList manages a list of servers.
 type ServerList struct {
 	mu      sync.RWMutex
