@@ -76,7 +76,7 @@ type Item struct {
 
 // NewClient creates a new Client with the specified servers and UDP mode.
 func NewClient(servers []string, useUDP bool) (*Client, error) {
-	ss := &ServerList{}
+	ss := new(ServerList)
 	if err := ss.SetServers(servers...); err != nil {
 		return nil, ErrNoServers
 	}
@@ -86,7 +86,12 @@ func NewClient(servers []string, useUDP bool) (*Client, error) {
 
 // SelectServer selects a server using the selector.
 func (c *Client) SelectServer(key string) (string, error) {
-	return c.selector.Select(key)
+	addr, err := c.selector.Select(key)
+	if err != nil {
+		return "", err
+	}
+
+	return addr.String(), nil
 }
 
 // connect establishes a TCP connection to the selected Memcached server.

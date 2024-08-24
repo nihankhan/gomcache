@@ -18,7 +18,6 @@ limitations under the License.
 package gomcache
 
 import (
-	"errors"
 	"hash/crc32"
 	"net"
 	"strings"
@@ -28,8 +27,8 @@ import (
 // ServerSelector represents an interface for selecting servers.
 type ServerSelector interface {
 	// Select returns the server address that a given item should be sent to.
-	Select(key string) (string, error)
-	Each(func(string) error) error
+	Select(key string) (net.Addr, error)
+	Each(func(net.Addr) error) error
 }
 
 // NewFromSelector returns a new Client using the provided ServerSelector and UDP mode.
@@ -43,9 +42,8 @@ func NewFromSelector(ss ServerSelector, useUDP bool) (*Client, error) {
 
 // ServerList manages a list of servers.
 type ServerList struct {
-	mu      sync.RWMutex
-	servers []string
-	addrs   []net.Addr
+	mu    sync.RWMutex
+	addrs []net.Addr
 }
 
 // staticAddr caches the Network() and String() values from any net.Addr.
@@ -65,55 +63,83 @@ func (s *staticAddr) String() string  { return s.str }
 
 // SetServers sets the list of servers.
 // This method resolves server addresses and is safe for concurrent use.
-func (sl *ServerList) SetServers(servers ...string) error {
-	addrs := make([]net.Addr, len(servers))
+func (ss *ServerList) SetServers(servers ...string) error {
+	naddr := make([]net.Addr, len(servers))
 	for i, server := range servers {
 		var addr net.Addr
 		var err error
+
 		if strings.Contains(server, "/") {
+			// Handle Unix domain sockets
 			addr, err = net.ResolveUnixAddr("unix", server)
+		} else if strings.Contains(server, ":") {
+			// Handle TCP and UDP addresses
+			// Try UDP first
+			addr, err = net.ResolveUDPAddr("udp", server)
+			if err != nil {
+				// If UDP fails, try TCP
+				addr, err = net.ResolveTCPAddr("tcp", server)
+			}
 		} else {
+			// Default to TCP if no protocol is specified and address does not contain `/` or `:`
 			addr, err = net.ResolveTCPAddr("tcp", server)
 		}
+
 		if err != nil {
 			return err
 		}
-		addrs[i] = newStaticAddr(addr)
+		naddr[i] = newStaticAddr(addr)
 	}
 
-	sl.mu.Lock()
-	defer sl.mu.Unlock()
-	sl.servers = servers
-	sl.addrs = addrs
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.addrs = naddr
 	return nil
 }
 
-// Each iterates over each server and calls the given function.
-func (sl *ServerList) Each(f func(string) error) error {
-	sl.mu.RLock()
-	defer sl.mu.RUnlock()
-	for _, addr := range sl.addrs {
-		if err := f(addr.String()); err != nil {
+// Each iterates over each server calling the given function
+func (ss *ServerList) Each(f func(net.Addr) error) error {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	for _, a := range ss.addrs {
+		if err := f(a); nil != err {
 			return err
 		}
 	}
 	return nil
 }
 
+// keyBufPool returns []byte buffers for use by PickServer's call to
+// crc32.ChecksumIEEE to avoid allocations. (but doesn't avoid the
+// copies, which at least are bounded in size and small)
+var keyBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 256)
+		return &b
+	},
+}
+
 // Select selects a server from the list using a consistent hashing strategy.
-func (sl *ServerList) Select(key string) (string, error) {
+func (sl *ServerList) Select(key string) (net.Addr, error) {
 	sl.mu.RLock()
 	defer sl.mu.RUnlock()
 
 	if len(sl.addrs) == 0 {
-		return "", errors.New("no servers available")
-	}
-	if len(sl.addrs) == 1 {
-		return sl.addrs[0].String(), nil
+		return nil, ErrNoServers
 	}
 
+	if len(sl.addrs) == 1 {
+		return sl.addrs[0], nil
+	}
+
+	bufp := keyBufPool.Get().(*[]byte)
+	n := copy(*bufp, []byte(key))
+
 	// Use consistent hashing to select a server
-	hash := crc32.ChecksumIEEE([]byte(key))
+	hash := crc32.ChecksumIEEE((*bufp)[:n])
+	keyBufPool.Put(bufp)
+
 	index := int(hash) % len(sl.addrs)
-	return sl.addrs[index].String(), nil
+
+	return sl.addrs[index], nil
 }

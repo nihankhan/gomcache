@@ -64,7 +64,6 @@ func TestSet(t *testing.T) {
 	}
 
 	err := client.Set(item)
-	fmt.Println("error: ", err)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}

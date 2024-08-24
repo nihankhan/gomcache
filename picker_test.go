@@ -19,6 +19,7 @@ package gomcache
 
 import (
 	"net"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -32,15 +33,37 @@ func TestSetServers(t *testing.T) {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if len(serverList.servers) != len(servers) {
-		t.Fatalf("expected %d servers, got %d", len(servers), len(serverList.servers))
+	if len(serverList.addrs) != len(servers) {
+		t.Fatalf("expected %d servers, got %d", len(servers), len(serverList.addrs))
 	}
 
 	for i, server := range servers {
-		if serverList.servers[i] != server {
-			t.Fatalf("expected server %s, got %s", server, serverList.servers[i])
+		expectedAddr := newStaticAddr(parseAddr(t, server))
+		if !reflect.DeepEqual(serverList.addrs[i], expectedAddr) {
+			t.Fatalf("expected server %v, got %v", expectedAddr, serverList.addrs[i])
 		}
 	}
+}
+
+func parseAddr(t *testing.T, server string) net.Addr {
+	var addr net.Addr
+	var err error
+
+	if strings.Contains(server, "/") {
+		addr, err = net.ResolveUnixAddr("unix", server)
+	} else if strings.Contains(server, ":") {
+		addr, err = net.ResolveUDPAddr("udp", server)
+		if err != nil {
+			addr, err = net.ResolveTCPAddr("tcp", server)
+		}
+	} else {
+		addr, err = net.ResolveTCPAddr("tcp", server)
+	}
+
+	if err != nil {
+		t.Fatalf("failed to resolve address %s: %v", server, err)
+	}
+	return newStaticAddr(addr)
 }
 
 func TestSelectServer(t *testing.T) {
@@ -61,7 +84,7 @@ func TestSelectServer(t *testing.T) {
 	// Check if the selected server is one of the servers in the list
 	isValidServer := false
 	for _, server := range servers {
-		if selectedServer == server {
+		if selectedServer.String() == server {
 			isValidServer = true
 			break
 		}
@@ -99,7 +122,7 @@ func TestSelectSingleServer(t *testing.T) {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if selectedServer != servers[0] {
+	if selectedServer.String() != servers[0] {
 		t.Fatalf("expected server %s, got %s", servers[0], selectedServer)
 	}
 }
@@ -114,7 +137,7 @@ func TestEach(t *testing.T) {
 	}
 
 	count := 0
-	err = serverList.Each(func(server string) error {
+	err = serverList.Each(func(addr net.Addr) error {
 		count++
 		return nil
 	})
@@ -164,15 +187,10 @@ func TestSetServersWithDifferentProtocols(t *testing.T) {
 	}
 
 	for i, server := range servers {
+		expectedAddr := parseAddr(t, server)
 		addr := serverList.addrs[i]
-		if strings.Contains(server, "/") {
-			if _, ok := addr.(*net.UnixAddr); !ok {
-				t.Fatalf("expected UnixAddr for server %s, got %T", server, addr)
-			}
-		} else {
-			if _, ok := addr.(*net.TCPAddr); !ok {
-				t.Fatalf("expected TCPAddr for server %s, got %T", server, addr)
-			}
+		if !reflect.DeepEqual(addr, newStaticAddr(expectedAddr)) {
+			t.Fatalf("expected address %v for server %s, got %v", expectedAddr, server, addr)
 		}
 	}
 }
