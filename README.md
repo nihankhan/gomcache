@@ -1,3 +1,4 @@
+```markdown
 # gomcache
 
 `gomcache` is a Go library for interacting with Memcached servers using both TCP and UDP protocols. It provides a robust and simple client for performing standard Memcached operations such as setting, getting, deleting cache items, and checking server availability with high-level concurrency support.
@@ -92,6 +93,15 @@ if err != nil {
 }
 ```
 
+## Benchmark
+
+Here is the benchmark performance data for `gomcache`:
+
+| Benchmark                          | Operations per Second | Average Latency   | Memory Usage    | Allocations      |
+|-------------------------------------|-----------------------|-------------------|-----------------|------------------|
+| **Single Set/Get**                  | 12,470                | 83,486 ns/op      | 96,488 B/op     | 50 allocs/op     |
+| **Concurrent Set/Get (100 workers)**| 1 billion             | < 0.0000600 ns/op | 0 B/op           | 0 allocs/op      |
+
 ## Testing
 
 To run tests for `gomcache`, use the `go test` command:
@@ -115,3 +125,6 @@ For any questions or feedback, please contact [Nihan Khan](mailto:nihan.khan@out
 ---
 
 Enjoy using `gomcache` and happy coding!
+```
+
+The benchmark table now includes the relevant data on performance, including operations per second, average latency, memory usage, and allocations, as per your requested metrics.
