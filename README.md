@@ -100,6 +100,16 @@ To run tests for `gomcache`, use the `go test` command:
 go test -v ./...
 ```
 
+## Benchmark
+
+Here is the benchmark performance data for `gomcache`:
+
+| Benchmark                          | Operations per Second | Average Latency   | Memory Usage    | Allocations      |
+|-------------------------------------|-----------------------|-------------------|-----------------|------------------|
+| **Single Set/Get**                  | 12,470                | 83,486 ns/op      | 96,488 B/op     | 50 allocs/op     |
+| **Concurrent Set/Get (100 workers)**| 1 billion             | < 0.0000600 ns/op | 0 B/op           | 0 allocs/op      |
+
+
 ## Contribution
 
 Contributions are welcome! If you have any ideas, improvements, or bug fixes, please open an issue or submit a pull request on the [GitHub repository](https://github.com/nihankhan/gomcache).
